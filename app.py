@@ -4,7 +4,21 @@ from datetime import date
 import streamlit as st
 
 import agent
+# ============================================================
+# V23：切换到 Supabase 云端 RAG
+# ============================================================
 
+try:
+    import cloud_rag
+
+    agent.search_knowledge = cloud_rag.search_knowledge
+
+    CLOUD_RAG_READY = True
+
+except Exception as e:
+
+    CLOUD_RAG_READY = False
+    CLOUD_RAG_ERROR = str(e)
 # =========================================================
 # V19 知识库管理
 # =========================================================
@@ -677,6 +691,12 @@ with st.sidebar:
 
     st.caption(
         cloud_status()
+    )
+    if CLOUD_RAG_READY:
+        st.caption("🧠 云端 RAG：已连接")
+    else:
+        st.caption(
+        f"🟡 云端 RAG：不可用 {CLOUD_RAG_ERROR}"
     )
 
 
@@ -2079,42 +2099,68 @@ elif menu == "📚 知识库管理":
     st.title("📚 知识库管理")
 
     st.caption(
-        "上传 PDF / TXT 学习资料，并重新构建 RAG 知识库"
+        "☁️ Supabase 云端知识库 + 本地 RAG 缓存"
     )
 
     try:
         import knowledge_manager
     except Exception as e:
-        st.error(
-            f"知识库管理模块加载失败：{e}"
-        )
+        st.error(f"知识库管理模块加载失败：{e}")
         st.stop()
 
-    # =========================
-    # 当前知识库状态
-    # =========================
+    # =====================================================
+    # 云端知识库状态
+    # =====================================================
 
-    st.subheader("📊 当前知识库")
+    st.subheader("☁️ 云端知识库状态")
 
-    files = knowledge_manager.get_knowledge_files()
-    status = knowledge_manager.get_chroma_status()
+    try:
+        cloud_files = knowledge_manager.get_cloud_knowledge_files()
 
-    col1, col2, col3 = st.columns(3)
+        if not isinstance(cloud_files, list):
+            cloud_files = []
 
-    with col1:
+        cloud_count = len(cloud_files)
+
+    except Exception as e:
+        cloud_files = []
+        cloud_count = 0
+        st.warning(f"云端知识库暂时无法读取：{e}")
+
+    # 本地文件
+    try:
+        local_files = knowledge_manager.get_knowledge_files()
+    except Exception:
+        local_files = []
+
+    # Chroma
+    try:
+        chroma_status = knowledge_manager.get_chroma_status()
+    except Exception:
+        chroma_status = {}
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    with c1:
         st.metric(
-            "资料数量",
-            len(files)
+            "☁️ 云端资料",
+            cloud_count
         )
 
-    with col2:
+    with c2:
         st.metric(
-            "知识块数量",
-            status.get("documents", 0)
+            "💻 本地资料",
+            len(local_files)
         )
 
-    with col3:
-        if status.get("exists"):
+    with c3:
+        st.metric(
+            "🧠 RAG知识块",
+            chroma_status.get("documents", 0)
+        )
+
+    with c4:
+        if chroma_status.get("exists"):
             st.metric(
                 "数据库状态",
                 "🟢 正常"
@@ -2127,140 +2173,367 @@ elif menu == "📚 知识库管理":
 
     st.divider()
 
-    # =========================
-    # 当前文件
-    # =========================
+    # =====================================================
+    # 云端资料列表
+    # =====================================================
 
-    st.subheader("📄 当前资料")
+    st.subheader("☁️ 云端学习资料")
 
-    if not files:
+    if not cloud_files:
+
         st.info(
-            "当前 knowledge 文件夹中还没有 PDF / TXT 文件。"
+            "当前 Supabase 云端知识库还没有资料。"
         )
+
     else:
-        for index, path in enumerate(files, 1):
-            info = knowledge_manager.get_file_info(
-                path
+
+        for index, item in enumerate(cloud_files, 1):
+
+            if not isinstance(item, dict):
+                continue
+
+            file_name = item.get(
+                "file_name",
+                "未知文件"
             )
 
-            st.write(
-                f"{index}. {info['name']} "
-                f"· {info['size_mb']} MB "
-                f"· {info['modified']}"
+            file_size = item.get(
+                "file_size",
+                0
             )
+
+            status = item.get(
+                "status",
+                "uploaded"
+            )
+
+            created_at = item.get(
+                "created_at",
+                ""
+            )
+
+            if file_size:
+
+                size_mb = file_size / 1024 / 1024
+
+                size_text = (
+                    f"{size_mb:.2f} MB"
+                )
+
+            else:
+
+                size_text = "未知大小"
+
+            col_a, col_b, col_c = st.columns(
+                [5, 2, 1]
+            )
+
+            with col_a:
+
+                st.write(
+                    f"**{index}. {file_name}**"
+                )
+
+                st.caption(
+                    f"{size_text} · {status} · {created_at}"
+                )
+
+            with col_b:
+
+                st.write("☁️ Supabase Storage")
+
+            with col_c:
+
+                document_id = item.get("id")
+
+                if document_id is not None:
+
+                    if st.button(
+                        "🗑️ 删除",
+                        key=f"delete_cloud_{document_id}"
+                    ):
+
+                        try:
+
+                            result = (
+                                knowledge_manager
+                                .delete_cloud_knowledge_file(
+                                    document_id
+                                )
+                            )
+
+                            if result.get("success"):
+
+                                st.success(
+                                    "云端文件已删除"
+                                )
+
+                                st.rerun()
+
+                            else:
+
+                                st.error(
+                                    result.get(
+                                        "message",
+                                        "删除失败"
+                                    )
+                                )
+
+                        except Exception as e:
+
+                            st.error(
+                                f"删除失败：{e}"
+                            )
 
     st.divider()
 
-    # =========================
+    # =====================================================
     # 上传资料
-    # =========================
+    # =====================================================
 
     st.subheader("📤 上传学习资料")
 
+    st.info(
+        "上传后会同时保存到 Supabase 云端 Storage，"
+        "并保存到当前运行环境的 knowledge/ 目录作为 RAG 构建缓存。"
+    )
+
     uploaded_files = st.file_uploader(
-        "选择 PDF 或 TXT 文件",
+        "选择 PDF / TXT 学习资料",
         type=["pdf", "txt"],
         accept_multiple_files=True,
-        help="支持一次上传多个 PDF / TXT 文件",
+        help="支持一次选择多个 PDF / TXT 文件",
     )
 
     if uploaded_files:
 
         if st.button(
-            "💾 保存上传资料",
+            "☁️ 上传到云端知识库",
             type="primary",
             use_container_width=True,
         ):
 
             success_count = 0
+            duplicate_count = 0
+            fail_count = 0
 
-            for uploaded_file in uploaded_files:
+            progress = st.progress(0)
 
-                success, message, path = (
-                    knowledge_manager.save_uploaded_file(
-                        uploaded_file
+            total = len(uploaded_files)
+
+            for index, uploaded_file in enumerate(
+                uploaded_files,
+                1
+            ):
+
+                try:
+
+                    file_bytes = uploaded_file.getvalue()
+
+                    result = (
+                        knowledge_manager
+                        .upload_to_cloud(
+                            uploaded_file.name,
+                            file_bytes
+                        )
                     )
+
+                    if result.get("success"):
+
+                        if result.get("duplicate"):
+
+                            duplicate_count += 1
+
+                            st.warning(
+                                f"⚠️ 已存在："
+                                f"{uploaded_file.name}"
+                            )
+
+                        else:
+
+                            success_count += 1
+
+                            st.success(
+                                f"☁️ 云端上传成功："
+                                f"{uploaded_file.name}"
+                            )
+
+                        # 同时保存本地 RAG 缓存
+                        try:
+
+                            local_success, local_message, local_path = (
+                                knowledge_manager
+                                .save_uploaded_file(
+                                    uploaded_file
+                                )
+                            )
+
+                            if local_success:
+
+                                st.caption(
+                                    f"💻 本地 RAG 缓存："
+                                    f"{local_message}"
+                                )
+
+                            else:
+
+                                st.warning(
+                                    f"本地缓存失败："
+                                    f"{local_message}"
+                                )
+
+                        except Exception as local_error:
+
+                            st.warning(
+                                f"本地缓存异常："
+                                f"{local_error}"
+                            )
+
+                    else:
+
+                        fail_count += 1
+
+                        st.error(
+                            f"❌ 上传失败："
+                            f"{uploaded_file.name}"
+                            f"："
+                            f"{result.get('message', '未知错误')}"
+                        )
+
+                except Exception as e:
+
+                    fail_count += 1
+
+                    st.error(
+                        f"❌ 处理 {uploaded_file.name} "
+                        f"失败：{e}"
+                    )
+
+                progress.progress(
+                    index / total
                 )
 
-                if success:
-                    st.success(message)
-                    success_count += 1
-                else:
-                    st.error(message)
+            st.divider()
+
+            st.write(
+                f"📊 上传结果："
+                f"成功 {success_count} 个，"
+                f"重复 {duplicate_count} 个，"
+                f"失败 {fail_count} 个"
+            )
 
             if success_count > 0:
+
                 st.success(
-                    f"成功保存 {success_count} 个文件"
+                    "🎉 云端知识库更新成功！"
                 )
 
-                st.rerun()
+            st.rerun()
 
     st.divider()
 
-    # =========================
-    # 重建知识库
-    # =========================
+    # =====================================================
+    # RAG 重建
+    # =====================================================
 
-    st.subheader("🔄 重建知识库")
+    st.subheader("🧠 重建 RAG 知识库")
 
     st.warning(
-        "新增或修改资料后，需要重新构建知识库，"
+        "新增资料后，需要重新构建 RAG 索引，"
         "AI 才能检索到最新内容。"
     )
 
     if st.button(
-        "🔄 重新构建知识库",
+        "🔄 重新构建 RAG 知识库",
         use_container_width=True,
     ):
 
         with st.spinner(
-            "正在扫描资料并构建 RAG 知识库，请稍候..."
+            "正在扫描 PDF / TXT 并构建 RAG，请稍候..."
         ):
 
-            result = (
-                knowledge_manager.rebuild_knowledge_base()
-            )
+            try:
 
-        if result["success"]:
+                result = (
+                    knowledge_manager
+                    .rebuild_knowledge_base()
+                )
+
+            except Exception as e:
+
+                result = {
+                    "success": False,
+                    "output": str(e)
+                }
+
+        if result.get("success"):
 
             st.success(
-                "🎉 知识库构建成功！"
+                "🎉 RAG 知识库构建完成！"
             )
 
-            st.code(
-                result["output"],
-                language="text",
+            output = result.get(
+                "output",
+                ""
             )
+
+            if output:
+
+                with st.expander(
+                    "📋 查看构建日志"
+                ):
+
+                    st.code(
+                        output,
+                        language="text"
+                    )
 
             st.rerun()
 
         else:
 
             st.error(
-                "❌ 知识库构建失败"
+                "❌ RAG 知识库构建失败"
             )
 
             st.code(
-                result["output"],
-                language="text",
+                result.get(
+                    "output",
+                    "未知错误"
+                ),
+                language="text"
             )
 
     st.divider()
 
-    # =========================
-    # 使用说明
-    # =========================
+    # =====================================================
+    # 使用流程
+    # =====================================================
 
-    st.subheader("💡 使用说明")
+    st.subheader("💡 使用流程")
 
     st.markdown(
         """
-        1. 上传 PDF / TXT 学习资料
-        2. 点击「保存上传资料」
-        3. 点击「重新构建知识库」
-        4. 等待 ChromaDB 构建完成
-        5. 前往「💬 AI知识库问答」
-        6. 提问测试新资料
+        **① 上传资料**
+
+        上传 PDF / TXT → 自动保存到 Supabase Storage
+
+        **② 本地缓存**
+
+        同时保存到 `knowledge/`，用于构建 RAG
+
+        **③ 重建 RAG**
+
+        点击「重新构建 RAG 知识库」
+
+        **④ AI 问答**
+
+        前往「💬 AI知识库问答」
+
+        **⑤ 云端持久化**
+
+        原始学习资料保存在 Supabase，
+        即使 Streamlit Cloud 重启，资料也不会丢失。
         """
     )
 
