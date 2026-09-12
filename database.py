@@ -4,6 +4,7 @@ from datetime import date
 
 from dotenv import load_dotenv
 from supabase import create_client
+from datetime import datetime, timedelta
 
 
 # =========================================================
@@ -329,3 +330,101 @@ def check_cloud_database():
 
     except Exception as e:
         return False, str(e)
+
+
+
+def review_wrong_question(
+    question_id,
+    is_correct,
+    current_review_count=0
+):
+    """
+    错题复习调度：
+
+    答错：
+        +1天
+
+    答对：
+        第1次 -> +3天
+        第2次 -> +7天
+        第3次 -> 掌握
+    """
+
+    if is_correct:
+        if current_review_count >= 2:
+            mastered = True
+            next_review_at = None
+            new_count = current_review_count + 1
+        elif current_review_count == 1:
+            mastered = False
+            next_review_at = (
+                datetime.now() + timedelta(days=7)
+            ).date().isoformat()
+            new_count = current_review_count + 1
+        else:
+            mastered = False
+            next_review_at = (
+                datetime.now() + timedelta(days=3)
+            ).date().isoformat()
+            new_count = current_review_count + 1
+
+    else:
+        mastered = False
+        next_review_at = (
+            datetime.now() + timedelta(days=1)
+        ).date().isoformat()
+        new_count = current_review_count
+
+    return update_wrong_question_review(
+        question_id=question_id,
+        review_count=new_count,
+        next_review_at=next_review_at,
+        mastered=mastered,
+    )
+def get_all_learning_records(limit=1000):
+    client = get_supabase()
+
+    return _execute_with_retry(
+        lambda: (
+            client
+            .table("learning_records")
+            .select("*")
+            .eq("user_id", USER_ID)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+    ).data
+
+
+def get_all_wrong_questions(limit=1000):
+    client = get_supabase()
+
+    return _execute_with_retry(
+        lambda: (
+            client
+            .table("wrong_questions")
+            .select("*")
+            .eq("user_id", USER_ID)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+    ).data
+
+
+def get_all_daily_tasks(limit=1000):
+    client = get_supabase()
+
+    return _execute_with_retry(
+        lambda: (
+            client
+            .table("daily_tasks")
+            .select("*")
+            .eq("user_id", USER_ID)
+            .order("task_date", desc=True)
+            .order("task_index")
+            .limit(limit)
+            .execute()
+        )
+    ).data
