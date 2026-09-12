@@ -3,6 +3,7 @@ from datetime import date
 import streamlit as st
 
 import agent
+from dashboard import render_dashboard
 
 try:
     from database import (
@@ -271,16 +272,17 @@ with st.sidebar:
     st.divider()
     st.header("功能")
     menu = st.radio(
-        "选择功能",
-        [
-            "📅 今日任务",
-            "📝 AI专项训练",
-            "❌ 错题复习",
-            "🧠 自适应分析",
-            "📊 学习报告",
-            "💬 AI知识库问答",
-        ],
-    )
+    "选择功能",
+    [
+        "📅 今日任务",
+        "📝 AI专项训练",
+        "❌ 错题复习",
+        "🧠 自适应分析",
+        "📊 学习报告",
+        "📈 V13学习看板",
+        "💬 AI知识库问答",
+    ],
+)
     st.divider()
     st.caption(cloud_status())
 
@@ -632,6 +634,9 @@ elif menu == "🧠 自适应分析":
                 st.success("计划已重新制定。")
             except Exception as e:
                 st.error(f"重新制定计划失败：{e}")
+# ---------- V13 学习数据看板 ----------
+elif menu == "📈 V13学习看板":
+    render_dashboard()
 
 # ---------- 学习报告 ----------
 elif menu == "📊 学习报告":
