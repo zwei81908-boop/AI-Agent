@@ -1,26 +1,29 @@
 import os, json, re
 from datetime import datetime, date, timedelta
 from collections import Counter, defaultdict
-
 import chromadb
 from dotenv import load_dotenv
 from openai import OpenAI
 from sentence_transformers import SentenceTransformer
-
+from database import (
+    save_learning_record,
+    get_learning_records,
+    save_wrong_question as save_cloud_wrong_question,
+    get_wrong_questions,
+    save_daily_task,
+    get_daily_tasks,
+    complete_daily_task,
+)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, '.env'))
-
 WRONG_QUESTIONS_FILE = os.path.join(BASE_DIR, 'wrong_questions.json')
 LEARNING_RECORDS_FILE = os.path.join(BASE_DIR, 'learning_records.json')
 DAILY_TASKS_FILE = os.path.join(BASE_DIR, 'daily_tasks.json')
 CHROMA_DIR = os.path.join(BASE_DIR, 'chroma_db')
 COLLECTION_NAME = 'software_engineer_notes'
-
 _embedding_model = None
 _collection = None
 _client = None
-
-
 def get_ai_client():
     global _client
     if _client is None:
@@ -35,8 +38,6 @@ def get_ai_client():
             raise RuntimeError('没有找到 DEEPSEEK_API_KEY，请检查 .env 或 Streamlit Cloud Secrets。')
         _client = OpenAI(api_key=key, base_url='https://api.deepseek.com')
     return _client
-
-
 def get_rag_resources():
     global _embedding_model, _collection
     if _embedding_model is None:
@@ -51,8 +52,6 @@ def get_rag_resources():
             raise RuntimeError(f'知识库集合 {COLLECTION_NAME!r} 不存在，请先完成知识库构建。') from e
         print('知识库加载完成')
     return _embedding_model, _collection
-
-
 # -------------------- JSON --------------------
 def load_json_file(path, default):
     if not os.path.exists(path):
@@ -60,29 +59,21 @@ def load_json_file(path, default):
     try:
         with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        return data
+            return data
     except Exception:
         return default
-
-
 def save_json_file(path, data):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + '.tmp'
     with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
-
-
 def today_str():
     return date.today().isoformat()
-
-
 def now_str():
     return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-
 # -------------------- RAG --------------------
-def search_knowledge(query, n=5):
+def search_knowledge(query, n=3):
     model, collection = get_rag_resources()
     vector = model.encode(query).tolist()
     result = collection.query(query_embeddings=[vector], n_results=max(1, n))
@@ -95,8 +86,6 @@ def search_knowledge(query, n=5):
             f'【知识片段{i + 1}｜第{meta.get("page", "?")}页｜{meta.get("section", "")}】\n{doc}'
         )
     return '\n\n'.join(parts) if parts else '没有检索到相关知识。'
-
-
 def ai(prompt, system='你是严谨的软件设计师考试学习助手。', temperature=0.2, json_mode=False):
     kwargs = dict(
         model='deepseek-chat',
@@ -107,8 +96,6 @@ def ai(prompt, system='你是严谨的软件设计师考试学习助手。', tem
         kwargs['response_format'] = {'type': 'json_object'}
     response = get_ai_client().chat.completions.create(**kwargs)
     return response.choices[0].message.content.strip()
-
-
 def extract_json(text):
     text = (text or '').strip()
     text = re.sub(r'^```(?:json)?\s*', '', text, flags=re.I)
@@ -141,35 +128,25 @@ def extract_json(text):
                     except json.JSONDecodeError as e:
                         raise ValueError(f'AI返回JSON格式错误：{e}') from e
     raise ValueError('AI返回的JSON不完整')
-
-
 # -------------------- learning data --------------------
 def load_wrong_questions():
     data = load_json_file(WRONG_QUESTIONS_FILE, [])
     if isinstance(data, dict):
         data = data.get('wrong_questions', data.get('questions', data.get('data', [])))
     return data if isinstance(data, list) else []
-
-
 def load_learning_records():
     data = load_json_file(LEARNING_RECORDS_FILE, [])
     if isinstance(data, dict):
         data = data.get('records', data.get('learning_records', data.get('data', [])))
     return data if isinstance(data, list) else []
-
-
 def load_daily_tasks():
     data = load_json_file(DAILY_TASKS_FILE, [])
     if isinstance(data, dict):
         data = data.get('daily_tasks', data.get('tasks', data.get('data', [])))
     return data if isinstance(data, list) else []
-
-
 def save_wrong_questions(items): save_json_file(WRONG_QUESTIONS_FILE, items)
 def save_learning_records(items): save_json_file(LEARNING_RECORDS_FILE, items)
 def save_daily_tasks(items): save_json_file(DAILY_TASKS_FILE, items)
-
-
 def normalize_question(q):
     q = dict(q or {})
     opts = q.get('options', {}) if isinstance(q.get('options'), dict) else {}
@@ -186,13 +163,9 @@ def normalize_question(q):
     q['knowledge_point'] = str(q.get('knowledge_point', q.get('topic', '未分类'))).strip() or '未分类'
     q['explanation'] = str(q.get('explanation', '')).strip()
     return q
-
-
 def make_wrong_key(q):
     q = normalize_question(q)
     return re.sub(r'\s+', '', q.get('question', '')).lower()
-
-
 def save_wrong_question(question, user_answer):
     question = normalize_question(question)
     items = load_wrong_questions()
@@ -206,6 +179,23 @@ def save_wrong_question(question, user_answer):
             item.setdefault('next_review_date', today_str())
             item.setdefault('mastered', False)
             save_wrong_questions(items)
+            # ====== 云端保存（找到旧错题，同步到supabase）======
+            try:
+                save_cloud_wrong_question(
+                    question=question.get("question", ""),
+                    options=[
+                        question.get("A", ""),
+                        question.get("B", ""),
+                        question.get("C", ""),
+                        question.get("D", "")
+                    ],
+                    correct_answer=question.get("correct_answer", ""),
+                    user_answer=user_answer,
+                    explanation=question.get("explanation", ""),
+                    topic=question.get("knowledge_point", "未分类")
+                )
+            except Exception as e:
+                print(f"⚠️ 云端错题保存失败：{e}")
             return item
     item = {
         **{k: question.get(k, '') for k in ['question', 'A', 'B', 'C', 'D', 'correct_answer', 'explanation', 'knowledge_point', 'source']},
@@ -220,9 +210,24 @@ def save_wrong_question(question, user_answer):
     }
     items.append(item)
     save_wrong_questions(items)
+    # ====== 云端保存（新增错题，同步到supabase）======
+    try:
+        save_cloud_wrong_question(
+            question=question.get("question", ""),
+            options=[
+                question.get("A", ""),
+                question.get("B", ""),
+                question.get("C", ""),
+                question.get("D", "")
+            ],
+            correct_answer=question.get("correct_answer", ""),
+            user_answer=user_answer,
+            explanation=question.get("explanation", ""),
+            topic=question.get("knowledge_point", "未分类")
+        )
+    except Exception as e:
+        print(f"⚠️ 云端错题保存失败：{e}")
     return item
-
-
 def get_due_wrong_questions():
     today = today_str()
     result = []
@@ -233,8 +238,6 @@ def get_due_wrong_questions():
         if due and due <= today:
             result.append(q)
     return result
-
-
 def update_wrong_review(question, is_correct):
     key = make_wrong_key(question)
     items = load_wrong_questions()
@@ -260,8 +263,6 @@ def update_wrong_review(question, is_correct):
     target['last_review_at'] = now_str()
     save_wrong_questions(items)
     return target
-
-
 def record_question_result(question, user_answer, is_correct, mode='training'):
     q = normalize_question(question)
     records = load_learning_records()
@@ -278,8 +279,17 @@ def record_question_result(question, user_answer, is_correct, mode='training'):
         'wrong': 0 if is_correct else 1,
     })
     save_learning_records(records)
-
-
+    # 同步学习记录到Supabase
+    try:
+        save_learning_record(
+            topic=q.get('knowledge_point','未分类'),
+            question=q.get('question',''),
+            answer=user_answer,
+            is_correct=is_correct,
+            score=100 if is_correct else 0
+        )
+    except Exception as e:
+        print(f"⚠️ 云端学习记录保存失败：{e}")
 # -------------------- learning analysis --------------------
 def calculate_learning_status():
     buckets = defaultdict(lambda: {'total': 0, 'correct': 0, 'wrong': 0, 'sessions': 0})
@@ -303,7 +313,6 @@ def calculate_learning_status():
         buckets[p]['correct'] += correct
         buckets[p]['wrong'] += max(0, total - correct)
         buckets[p]['sessions'] += 1
-
     wrong_counts = Counter(
         q.get('knowledge_point', '未分类')
         for q in load_wrong_questions()
@@ -333,13 +342,9 @@ def calculate_learning_status():
         x['priority'] = round((100 - x['mastery']) + x['wrong_questions'] * 8 + (10 if x['total'] < 5 else 0), 1)
     out.sort(key=lambda x: x['priority'], reverse=True)
     return out
-
-
 def choose_adaptive_topic():
     status = calculate_learning_status()
     return status[0]['knowledge_point'] if status else '软件开发方法'
-
-
 def analyze_wrong_questions():
     wrong = [q for q in load_wrong_questions() if not q.get('mastered')]
     counts = Counter(q.get('knowledge_point', '未分类') for q in wrong)
@@ -350,8 +355,6 @@ def analyze_wrong_questions():
         'status': status,
         'due_count': len(get_due_wrong_questions()),
     }
-
-
 def adaptive_analysis():
     status = calculate_learning_status()
     today = get_today_stats()
@@ -363,11 +366,9 @@ def adaptive_analysis():
         'priority_topic': status[0]['knowledge_point'] if status else '软件开发方法',
         'status': status[:10],
     }
-
-
 # -------------------- question generation --------------------
 def generate_question(knowledge_point):
-    knowledge = search_knowledge(knowledge_point, 5)
+    knowledge = search_knowledge(knowledge_point, 3)
     prompt = f'''
 根据下面的软件设计师知识库生成1道高质量单选题。
 要求：
@@ -377,10 +378,8 @@ def generate_question(knowledge_point):
 4. explanation说明正确选项为什么正确，并简要指出关键干扰项为什么错。
 5. knowledge_point必须是明确知识点。
 6. 只返回JSON对象，不要Markdown，不要额外文字。
-
 JSON格式：
 {{"question":"题目","options":{{"A":"","B":"","C":"","D":""}},"correct_answer":"A","explanation":"","knowledge_point":"","source":"知识库"}}
-
 目标知识点：{knowledge_point}
 知识库：
 {knowledge}
@@ -390,16 +389,12 @@ JSON格式：
     if not q['question'] or any(not q[k] for k in 'ABCD') or q['correct_answer'] not in 'ABCD':
         raise ValueError('AI返回的题目格式不正确。')
     return q
-
-
 # -------------------- daily plan --------------------
 def get_today_tasks():
     for plan in load_daily_tasks():
         if str(plan.get('date', ''))[:10] == today_str():
             return plan
     return None
-
-
 def _fallback_plan(weakest, due_count):
     tasks = []
     if due_count:
@@ -411,8 +406,6 @@ def _fallback_plan(weakest, due_count):
         {'name': '综合自测', 'minutes': 25, 'description': '完成混合题并统计正确率，重点复盘错误选项。'},
     ]
     return tasks
-
-
 def create_dynamic_study_plan(force=False):
     existing = get_today_tasks()
     if existing and not force:
@@ -428,7 +421,6 @@ def create_dynamic_study_plan(force=False):
     unfinished = []
     if previous:
         unfinished = [x.get('name', '') for x in previous.get('tasks', []) if not x.get('completed')]
-
     prompt = f'''
 根据学生真实学习数据制定今天约120分钟的学习计划。
 当前最薄弱知识点：{weakest}
@@ -442,7 +434,6 @@ def create_dynamic_study_plan(force=False):
         plan = extract_json(ai(prompt, system='你是专业的软件设计师考试AI学习规划师。', temperature=0.2, json_mode=True))
     except Exception:
         plan = {'goal': f'强化{weakest}并完成到期错题复习', 'tasks': _fallback_plan(weakest, len(due))}
-
     tasks = []
     for t in plan.get('tasks', []):
         if not isinstance(t, dict):
@@ -453,29 +444,24 @@ def create_dynamic_study_plan(force=False):
             mins = 20
         tasks.append({'name': str(t.get('name', '学习任务')), 'minutes': mins,
                       'description': str(t.get('description', '')), 'completed': False, 'completed_at': None})
-
     if due and not any('错题' in t['name'] and '复习' in t['name'] for t in tasks):
         tasks.insert(0, {'name': '到期错题间隔复习', 'minutes': 20,
                           'description': f'逐题复习今天到期的{len(due)}道错题并更新间隔复习状态。',
                           'completed': False, 'completed_at': None})
     if not tasks:
         tasks = [{**x, 'completed': False, 'completed_at': None} for x in _fallback_plan(weakest, len(due))]
-
     # 防止AI生成极端长计划；保留所有任务，不删除任务。
     total = sum(t['minutes'] for t in tasks)
     if total > 150:
         scale = 120 / total
         for t in tasks:
             t['minutes'] = max(5, round(t['minutes'] * scale))
-
     goal = str(plan.get('goal') or f'强化{weakest}并完成今日核心学习任务')
     day = {'date': today_str(), 'goal': goal, 'tasks': tasks, 'created_at': now_str()}
     all_plans = [p for p in load_daily_tasks() if str(p.get('date', ''))[:10] != today_str()]
     all_plans.append(day)
     save_daily_tasks(all_plans)
     return day
-
-
 def complete_task(task_number):
     plan = get_today_tasks()
     if not plan:
@@ -499,8 +485,6 @@ def complete_task(task_number):
             break
     save_daily_tasks(plans)
     return True, f"已完成任务 {idx + 1}：{task.get('name', '')}"
-
-
 # -------------------- reports --------------------
 def get_today_stats():
     records = [r for r in load_learning_records() if str(r.get('date', ''))[:10] == today_str()]
@@ -508,8 +492,6 @@ def get_today_stats():
     questions = len(records)
     return {'questions': questions, 'correct': correct, 'wrong': questions - correct,
             'accuracy': round(correct / questions * 100, 1) if questions else 0.0}
-
-
 def learning_report():
     plan = get_today_tasks()
     stats = get_today_stats()
@@ -527,8 +509,6 @@ def learning_report():
         'tomorrow_basis': [x['knowledge_point'] for x in status[:3]],
         'plan': plan,
     }
-
-
 def show_today_tasks():
     plan = get_today_tasks() or create_dynamic_study_plan()
     print('\n' + '=' * 60 + '\n📋 今日学习任务\n' + '=' * 60)
@@ -540,8 +520,6 @@ def show_today_tasks():
     mins = sum(int(t.get('minutes', 0) or 0) for t in plan.get('tasks', []) if t.get('completed'))
     print(f'\n📊 完成：{done}/{len(plan.get("tasks", []))}\n⏱️ 学习时间：{mins}/{total}分钟')
     return plan
-
-
 def start_today_learning():
     plan = get_today_tasks() or create_dynamic_study_plan()
     for i, t in enumerate(plan.get('tasks', []), 1):
@@ -550,8 +528,6 @@ def start_today_learning():
             return plan
     print('🎉 今天所有任务都完成了！')
     return plan
-
-
 # -------------------- question session --------------------
 current_question = None
 training_mode = False
@@ -562,8 +538,6 @@ training_results = []
 wrong_review_mode = False
 wrong_review_questions = []
 wrong_review_index = 0
-
-
 def start_training(topic=None):
     global current_question, training_mode, training_index, training_correct, training_results, wrong_review_mode
     training_mode = True
@@ -577,8 +551,6 @@ def start_training(topic=None):
     current_question = q
     show_question(q)
     return q
-
-
 def show_question(q):
     q = normalize_question(q)
     print('\n' + '=' * 60 + '\n📝 软件设计师训练\n' + '=' * 60)
@@ -587,8 +559,6 @@ def show_question(q):
     for k in 'ABCD':
         print(f'{k}. {q.get(k, "")}')
     print('\n请输入 A / B / C / D')
-
-
 def grade_answer(user_answer, review=False):
     global current_question, training_index, training_correct, training_results, training_mode, wrong_review_index, wrong_review_mode
     if not current_question:
@@ -599,7 +569,6 @@ def grade_answer(user_answer, review=False):
         return None
     correct = current_question.get('correct_answer', '').upper()
     ok = ans == correct
-
     if review:
         # 复习也计入学习记录，保证学习进度与报告真实反映复习结果。
         record_question_result(current_question, ans, ok, 'wrong_review')
@@ -623,7 +592,6 @@ def grade_answer(user_answer, review=False):
             current_question = wrong_review_questions[wrong_review_index]
             show_question(current_question)
         return ok
-
     record_question_result(current_question, ans, ok, 'training' if training_mode else 'single')
     if not ok:
         save_wrong_question(current_question, ans)
@@ -645,8 +613,6 @@ def grade_answer(user_answer, review=False):
     else:
         current_question = None
     return ok
-
-
 def start_wrong_review():
     global wrong_review_mode, wrong_review_questions, wrong_review_index, current_question, training_mode
     wrong_review_questions = get_due_wrong_questions()
@@ -663,8 +629,6 @@ def start_wrong_review():
     print(f'📚 今天到期：{len(wrong_review_questions)}题')
     show_question(current_question)
     return current_question
-
-
 # -------------------- CLI views --------------------
 def show_learning_progress():
     s = calculate_learning_status()
@@ -674,10 +638,8 @@ def show_learning_progress():
     for i, x in enumerate(s, 1):
         print(f"{i}. {x['knowledge_point']}｜正确率 {x['accuracy']}%｜答题 {x['total']}｜错题 {x['wrong_questions']}｜掌握度 {x['mastery']}%｜优先级 {x['priority']}")
     return s
-
-
 def normal_chat(user_input):
-    knowledge = search_knowledge(user_input, 5)
+    knowledge = search_knowledge(user_input, 3)
     return ai(
         f'''请根据软件设计师知识库回答用户的知识问题。
 不要把“系统功能命令”当成知识问题；这里只处理普通知识问答。
@@ -687,8 +649,6 @@ def normal_chat(user_input):
 {knowledge}''',
         temperature=0.25,
     )
-
-
 def command_help():
     print('''\n可用命令：
 每日任务 / 查看每日任务 / 今天要做什么
@@ -703,8 +663,6 @@ def command_help():
 动态计划 / 重新制定今天计划
 学习报告 / 总结今天学习
 帮助 / 你好 / 普通知识问题 / exit''')
-
-
 def show_review_schedule():
     due = get_due_wrong_questions()
     allq = [q for q in load_wrong_questions() if not q.get('mastered')]
@@ -719,8 +677,6 @@ def show_review_schedule():
         print('- 暂无')
     for d, p in upcoming[:15]:
         print('-', d, p)
-
-
 def show_learning_records():
     records = load_learning_records()
     today = [r for r in records if str(r.get('date', ''))[:10] == today_str()]
@@ -729,8 +685,6 @@ def show_learning_records():
     print(f'今日答题：{len(today)}题｜正确：{correct}题｜错误：{len(today)-correct}题｜正确率：{correct/len(today)*100:.1f}%' if today else '今日还没有答题记录。')
     print(f'累计答题记录：{len(records)}条')
     return records
-
-
 def _complete_task_match(text):
     patterns = [
         r'^完成\s*任务\s*(\d+)$',
@@ -743,15 +697,11 @@ def _complete_task_match(text):
         if m:
             return m.group(1)
     return None
-
-
 def _training_topic_from_text(text):
     m = re.match(r'^(?:AI\s*出题|出题)(?:关于|：|:)?\s*(.+)?$', text, flags=re.I)
     if m:
         return (m.group(1) or choose_adaptive_topic()).strip() or choose_adaptive_topic()
     return None
-
-
 def run_cli():
     global current_question, wrong_review_mode, training_mode
     print('\n' + '=' * 65)
@@ -759,7 +709,6 @@ def run_cli():
     print('=' * 65)
     print('① RAG知识问答 ② AI出题 ③ 自动批改 ④ 错题系统 ⑤ 间隔复习 ⑥ 自适应分析 ⑦ 动态计划 ⑧ 学习报告')
     print('输入 exit 退出。')
-
     while True:
         try:
             text = input('\n你：').strip()
@@ -772,7 +721,6 @@ def run_cli():
         if not text:
             print('Agent：请输入内容。')
             continue
-
         # 答题模式：退出/导航命令优先处理，避免被锁死在答题状态。
         if wrong_review_mode:
             if text in ['退出错题复习', '退出复习', '取消答题', 'exit training', '退出训练']:
@@ -811,7 +759,6 @@ def run_cli():
                 continue
             print('当前正在答题，请输入 A / B / C / D。')
             continue
-
         # 功能命令必须在RAG之前识别。
         if text in ['每日任务', '查看今日任务', '查看每日任务', '查看任务', '今天要做什么']:
             show_today_tasks(); continue
@@ -864,12 +811,42 @@ def run_cli():
         if text in ['你好', '您好']:
             print('你好！我是软件设计师 AI 学习助手。你可以直接提问，也可以使用“每日任务、开始专项训练、开始错题复习、自适应分析、学习报告”等功能。')
             continue
-
         try:
             print('\nAgent：\n' + normal_chat(text))
         except Exception as e:
             print('⚠️ Agent运行错误：', e)
-
-
 if __name__ == '__main__':
+    run_cli()
+
+def test_cloud_database():
+    print("\n==============================")
+    print("☁️ 云端数据库测试")
+    print("==============================")
+    # 测试学习记录
+    save_learning_record(
+        topic="测试知识点",
+        question="这是云端数据库测试题",
+        answer="测试答案",
+        is_correct=True,
+        score=100
+    )
+    records = get_learning_records()
+    print(f"✅ 学习记录：{len(records)} 条")
+    # 测试错题
+    save_cloud_wrong_question(
+        question="这是云端错题测试",
+        options=["A", "B", "C", "D"],
+        correct_answer="A",
+        user_answer="B",
+        explanation="这是测试解释",
+        topic="测试知识点"
+    )
+    wrong = get_wrong_questions()
+    print(f"✅ 错题记录：{len(wrong)} 条")
+    print("\n🎉 Supabase 云端数据测试成功！")
+
+# 新增：调用测试函数，运行直接测试数据库连接
+if __name__ == '__main__':
+    # 取消下面注释即可测试云端数据库
+    # test_cloud_database()
     run_cli()
