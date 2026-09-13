@@ -1,4 +1,4 @@
-import os, json, re
+import os, json, re, hashlib, time
 from datetime import datetime, date, timedelta
 from collections import Counter, defaultdict
 import chromadb
@@ -14,16 +14,19 @@ from database import (
     get_daily_tasks,
     complete_daily_task,
 )
+# V33 FINAL
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, '.env'))
 WRONG_QUESTIONS_FILE = os.path.join(BASE_DIR, 'wrong_questions.json')
 LEARNING_RECORDS_FILE = os.path.join(BASE_DIR, 'learning_records.json')
 DAILY_TASKS_FILE = os.path.join(BASE_DIR, 'daily_tasks.json')
+GENERATED_QUESTIONS_FILE = os.path.join(BASE_DIR, 'generated_questions.json')
 CHROMA_DIR = os.path.join(BASE_DIR, 'chroma_db')
 COLLECTION_NAME = 'software_engineer_notes'
 _embedding_model = None
 _collection = None
 _client = None
+_KNOWLEDGE_CACHE = {}
 def get_ai_client():
     global _client
     if _client is None:
@@ -73,7 +76,14 @@ def today_str():
 def now_str():
     return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 # -------------------- RAG --------------------
-def search_knowledge(query, n=3):
+def search_knowledge(query, n=5):
+    """V33：知识检索短缓存，减少重复训练时的向量计算/云端查询。"""
+    key = (str(query).strip(), int(n))
+    now = time.time()
+    cached = _KNOWLEDGE_CACHE.get(key)
+    if cached and now - cached[0] < 300:
+        return cached[1]
+
     model, collection = get_rag_resources()
     vector = model.encode(query).tolist()
     result = collection.query(query_embeddings=[vector], n_results=max(1, n))
@@ -85,17 +95,29 @@ def search_knowledge(query, n=3):
         parts.append(
             f'【知识片段{i + 1}｜第{meta.get("page", "?")}页｜{meta.get("section", "")}】\n{doc}'
         )
-    return '\n\n'.join(parts) if parts else '没有检索到相关知识。'
-def ai(prompt, system='你是严谨的软件设计师考试学习助手。', temperature=0.2, json_mode=False):
-    kwargs = dict(
-        model='deepseek-chat',
-        messages=[{'role': 'system', 'content': system}, {'role': 'user', 'content': prompt}],
-        temperature=temperature,
-    )
+    value = '\n\n'.join(parts) if parts else '没有检索到相关知识。'
+    if len(_KNOWLEDGE_CACHE) > 64:
+        _KNOWLEDGE_CACHE.clear()
+    _KNOWLEDGE_CACHE[key] = (now, value)
+    return value
+
+def ai(prompt, system='你是严谨的软件设计师考试学习助手。', temperature=0.2, json_mode=False, max_tokens=None):
+    """统一 AI 调用入口。支持较小 max_tokens，减少出题/批改等待时间。"""
+    kwargs = {
+        'model': 'deepseek-chat',
+        'messages': [
+            {'role': 'system', 'content': system},
+            {'role': 'user', 'content': prompt},
+        ],
+        'temperature': temperature,
+    }
+    if max_tokens:
+        kwargs['max_tokens'] = int(max_tokens)
     if json_mode:
         kwargs['response_format'] = {'type': 'json_object'}
     response = get_ai_client().chat.completions.create(**kwargs)
     return response.choices[0].message.content.strip()
+
 def extract_json(text):
     text = (text or '').strip()
     text = re.sub(r'^```(?:json)?\s*', '', text, flags=re.I)
@@ -147,6 +169,67 @@ def load_daily_tasks():
 def save_wrong_questions(items): save_json_file(WRONG_QUESTIONS_FILE, items)
 def save_learning_records(items): save_json_file(LEARNING_RECORDS_FILE, items)
 def save_daily_tasks(items): save_json_file(DAILY_TASKS_FILE, items)
+class QuestionExhaustedError(RuntimeError):
+    """当前知识点暂时无法再生成新的、不重复的题目。"""
+
+
+def load_generated_questions():
+    data = load_json_file(GENERATED_QUESTIONS_FILE, [])
+    return data if isinstance(data, list) else []
+
+
+def save_generated_questions(items):
+    save_json_file(GENERATED_QUESTIONS_FILE, items)
+
+
+def question_key(q):
+    q = normalize_question(q)
+    raw = '|'.join([
+        q.get('knowledge_point', '').strip(),
+        q.get('question', '').strip(),
+        q.get('A', '').strip(), q.get('B', '').strip(),
+        q.get('C', '').strip(), q.get('D', '').strip(),
+    ])
+    normalized = re.sub(r'[\s\u3000，。、“”‘’：；！？（）()、/\\]+', '', raw).lower()
+    return hashlib.sha1(normalized.encode('utf-8')).hexdigest()
+
+
+def _canonical_topic(topic):
+    return re.sub(r'\s+', '', str(topic or '').strip()).lower()
+
+
+def generated_question_keys(topic):
+    topic = str(topic).strip()
+    canonical = _canonical_topic(topic)
+    keys = set()
+    for item in load_generated_questions():
+        if _canonical_topic(item.get('knowledge_point', '')) == canonical and item.get('key'):
+            keys.add(item['key'])
+    # 兼容旧数据：已做过/错题也算已出现，避免重复。
+    for item in load_learning_records() + load_wrong_questions():
+        if _canonical_topic(item.get('knowledge_point', item.get('topic', ''))) == canonical:
+            try:
+                keys.add(question_key(item))
+            except Exception:
+                pass
+    return keys
+
+
+def remember_generated_question(q):
+    items = load_generated_questions()
+    key = question_key(q)
+    if any(x.get('key') == key for x in items):
+        return
+    items.append({
+        'key': key,
+        'knowledge_point': q.get('knowledge_point', '未分类'),
+        'question': q.get('question', ''),
+        'created_at': now_str(),
+    })
+    # 只保留最近2000道，避免文件无限增长。
+    save_generated_questions(items[-2000:])
+
+
 def normalize_question(q):
     q = dict(q or {})
     opts = q.get('options', {}) if isinstance(q.get('options'), dict) else {}
@@ -346,15 +429,28 @@ def choose_adaptive_topic():
     status = calculate_learning_status()
     return status[0]['knowledge_point'] if status else '软件开发方法'
 def analyze_wrong_questions():
-    wrong = [q for q in load_wrong_questions() if not q.get('mastered')]
+    """返回可直接给Web/CLI展示的错题分析，不调用AI。"""
+    wrong = [normalize_question(q) for q in load_wrong_questions() if not q.get('mastered')]
     counts = Counter(q.get('knowledge_point', '未分类') for q in wrong)
     status = calculate_learning_status()
+    ranked = []
+    for topic, count in counts.most_common():
+        item = next((x for x in status if x.get('knowledge_point') == topic), {})
+        ranked.append({
+            'knowledge_point': topic,
+            'count': count,
+            'accuracy': item.get('accuracy', 0),
+            'mastery': item.get('mastery', 0),
+            'priority': item.get('priority', item.get('weakness_score', 0)),
+        })
     return {
         'total': len(wrong),
-        'knowledge_points': [{'knowledge_point': k, 'count': v} for k, v in counts.most_common()],
-        'status': status,
         'due_count': len(get_due_wrong_questions()),
+        'knowledge_points': ranked,
+        'status': status,
+        'recommendation': ranked[0]['knowledge_point'] if ranked else (status[0]['knowledge_point'] if status else '软件开发方法'),
     }
+
 def adaptive_analysis():
     status = calculate_learning_status()
     today = get_today_stats()
@@ -368,27 +464,62 @@ def adaptive_analysis():
     }
 # -------------------- question generation --------------------
 def generate_question(knowledge_point):
-    knowledge = search_knowledge(knowledge_point, 3)
-    prompt = f'''
-根据下面的软件设计师知识库生成1道高质量单选题。
-要求：
-1. 题目必须尽量来自知识库，不要凭空创造考试知识。
-2. 只能有一个正确答案。
-3. 必须有A/B/C/D四个选项。
-4. explanation说明正确选项为什么正确，并简要指出关键干扰项为什么错。
-5. knowledge_point必须是明确知识点。
-6. 只返回JSON对象，不要Markdown，不要额外文字。
-JSON格式：
-{{"question":"题目","options":{{"A":"","B":"","C":"","D":""}},"correct_answer":"A","explanation":"","knowledge_point":"","source":"知识库"}}
-目标知识点：{knowledge_point}
+    """快速出题 + 持久化去重；连续生成不到新题时明确提示题目已耗尽。"""
+    topic = str(knowledge_point or '').strip() or '软件开发方法'
+    used_keys = generated_question_keys(topic)
+
+    try:
+        knowledge = search_knowledge(topic, 3)
+    except TypeError:
+        knowledge = search_knowledge(topic)
+
+    used_text = []
+    for item in load_generated_questions():
+        if str(item.get('knowledge_point', '')).strip() == topic and item.get('question'):
+            used_text.append(item['question'])
+    used_text = used_text[-12:]
+
+    prompt = f"""根据给出的软件设计师知识库，围绕“{topic}”生成1道高质量单项选择题。
+只允许一个正确答案，必须有A/B/C/D四个选项，必须依据知识库。
+不要与“已生成题目”重复；如果知识库内容不足以产生新的独立题目，直接返回：{{"exhausted":true}}。
+返回严格JSON，不要Markdown。
+格式：{{"question":"","options":{{"A":"","B":"","C":"","D":""}},"correct_answer":"A","explanation":"","knowledge_point":"{topic}","source":"知识库"}}
+
 知识库：
 {knowledge}
-'''
-    data = extract_json(ai(prompt, system='你是软件设计师考试命题专家，只能依据给出的知识库命题。', temperature=0.2, json_mode=True))
-    q = normalize_question(data)
-    if not q['question'] or any(not q[k] for k in 'ABCD') or q['correct_answer'] not in 'ABCD':
-        raise ValueError('AI返回的题目格式不正确。')
-    return q
+
+已生成题目（仅用于去重）：
+{json.dumps(used_text, ensure_ascii=False)}"""
+
+    last_q = None
+    for attempt in range(3):
+        data = extract_json(ai(
+            prompt,
+            system='你是软件设计师考试命题专家。严格依据知识库，快速生成单选题。',
+            temperature=0.1,
+            json_mode=True,
+            max_tokens=700,
+        ))
+        if data.get('exhausted'):
+            raise QuestionExhaustedError(
+                f'⚠️ 当前知识点“{topic}”没有检测到新的可用题目；已生成题目不会重复。'
+            )
+        q = normalize_question(data)
+        if not q.get('question') or any(not q.get(k) for k in 'ABCD') or q.get('correct_answer') not in 'ABCD':
+            raise ValueError('AI返回的题目格式不正确。')
+        last_q = q
+        key = question_key(q)
+        if key not in used_keys:
+            q['_training_topic'] = topic
+            remember_generated_question(q)
+            return q
+        # 第二次尝试明确要求换角度。
+        prompt += '\n刚才生成的题目重复了。请换一个考查角度，重新生成完全不同的新题。'
+
+    raise QuestionExhaustedError(
+        f'⚠️ 当前知识点“{topic}”可生成的新题有限，未找到新的不重复题目。'
+    )
+
 # -------------------- daily plan --------------------
 def get_today_tasks():
     for plan in load_daily_tasks():
@@ -559,7 +690,8 @@ def show_question(q):
     for k in 'ABCD':
         print(f'{k}. {q.get(k, "")}')
     print('\n请输入 A / B / C / D')
-def grade_answer(user_answer, review=False):
+def grade_answer(user_answer, review=False, advance=True):
+    """本地快速判题；默认保持CLI行为，Web可传 advance=False 先展示答案再进入下一题。"""
     global current_question, training_index, training_correct, training_results, training_mode, wrong_review_index, wrong_review_mode
     if not current_question:
         return None
@@ -567,52 +699,62 @@ def grade_answer(user_answer, review=False):
     if ans not in 'ABCD':
         print('请输入 A / B / C / D。')
         return None
-    correct = current_question.get('correct_answer', '').upper()
+    correct = str(current_question.get('correct_answer', '')).upper()[:1]
     ok = ans == correct
+
     if review:
-        # 复习也计入学习记录，保证学习进度与报告真实反映复习结果。
         record_question_result(current_question, ans, ok, 'wrong_review')
         target = update_wrong_review(current_question, ok)
         if ok:
             next_date = target.get('next_review_date') if target else None
-            if target and target.get('mastered'):
-                msg = '🎉 连续答对3次，已掌握！'
+            msg = '🎉 连续答对3次，已掌握！' if target and target.get('mastered') else f'✅ 复习答对！下一次复习：{next_date}'
+        else:
+            msg = f'❌ 仍答错，正确答案：{correct}；下一次复习：{target.get("next_review_date") if target else "明天"}'
+        print(msg)
+        print('📖 原解析：', current_question.get('explanation', '暂无解析'))
+        if advance:
+            wrong_review_index += 1
+            if wrong_review_index >= len(wrong_review_questions):
+                print('🎉 错题复习完成！')
+                current_question = None
+                wrong_review_mode = False
             else:
-                msg = f'✅ 复习答对！下一次复习：{next_date}'
-            print(msg)
-        else:
-            print(f'❌ 仍答错，正确答案：{correct}；下一次复习：{target.get("next_review_date") if target else "明天"}')
-        print('📖 原解析：', current_question.get('explanation', ''))
-        wrong_review_index += 1
-        if wrong_review_index >= len(wrong_review_questions):
-            print('🎉 错题复习完成！')
-            current_question = None
-            wrong_review_mode = False
-        else:
-            current_question = wrong_review_questions[wrong_review_index]
-            show_question(current_question)
+                current_question = normalize_question(wrong_review_questions[wrong_review_index])
+                show_question(current_question)
         return ok
+
+    # 判题只做本地字符串比较，不再调用AI，因此响应应为瞬时。
     record_question_result(current_question, ans, ok, 'training' if training_mode else 'single')
     if not ok:
         save_wrong_question(current_question, ans)
+
     print('✅ 回答正确！' if ok else f'❌ 回答错误！正确答案：{correct}')
-    print('📖 解析：', current_question.get('explanation', ''))
+    print('📖 解析：', current_question.get('explanation', '暂无解析'))
+
     if training_mode:
         training_index += 1
-        training_correct += 1 if ok else 0
-        training_results.append({'question': current_question.get('question'), 'is_correct': ok})
-        if training_index >= training_total:
-            print(f'\n🏆 专项训练完成：{training_correct}/{training_total}，正确率 {training_correct / training_total * 100:.1f}%')
-            training_mode = False
-            current_question = None
-        else:
-            topic = current_question.get('_training_topic') or choose_adaptive_topic()
-            current_question = generate_question(topic)
-            current_question['_training_topic'] = topic
-            show_question(current_question)
+        training_correct += int(ok)
+        training_results.append({
+            'question': current_question.get('question'),
+            'knowledge_point': current_question.get('knowledge_point'),
+            'user_answer': ans,
+            'correct_answer': correct,
+            'is_correct': ok,
+        })
+        if advance:
+            if training_index >= training_total:
+                print(f'\n🏆 专项训练完成：{training_correct}/{training_total}，正确率 {training_correct / training_total * 100:.1f}%')
+                training_mode = False
+                current_question = None
+            else:
+                topic = current_question.get('_training_topic') or choose_adaptive_topic()
+                current_question = generate_question(topic)
+                show_question(current_question)
     else:
-        current_question = None
+        if advance:
+            current_question = None
     return ok
+
 def start_wrong_review():
     global wrong_review_mode, wrong_review_questions, wrong_review_index, current_question, training_mode
     wrong_review_questions = get_due_wrong_questions()
@@ -639,7 +781,7 @@ def show_learning_progress():
         print(f"{i}. {x['knowledge_point']}｜正确率 {x['accuracy']}%｜答题 {x['total']}｜错题 {x['wrong_questions']}｜掌握度 {x['mastery']}%｜优先级 {x['priority']}")
     return s
 def normal_chat(user_input):
-    knowledge = search_knowledge(user_input, 3)
+    knowledge = search_knowledge(user_input, 5)
     return ai(
         f'''请根据软件设计师知识库回答用户的知识问题。
 不要把“系统功能命令”当成知识问题；这里只处理普通知识问答。

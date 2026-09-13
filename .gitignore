@@ -1,7 +1,62 @@
-.venv/
-.env
+﻿# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.class
+
+# Virtual environments
+.venv/
+.venv-1/
+venv/
+env/
+
+# Environment / secrets
+.env
 .streamlit/secrets.toml
+
+# Local vector database
 chroma_db/
+
+# Runtime learning data
+daily_tasks.json
+learning_records.json
+wrong_questions.json
+generated_questions.json
+data/daily_tasks.json
+data/learning_records.json
+data/wrong_questions.json
+
+# Local knowledge files - stored in cloud knowledge base
 knowledge/*.pdf
+knowledge/*.txt
+
+# Backup files
+backup/
+v32_backup/
+*_backup.py
+*_before_*.py
+
+# Development / temporary scripts
+apply_*.py
+check_*.py
+cleanup_*.py
+delete_test_*.py
+v25_cloud_sync.py
+
+# Temporary notes
+改前.txt
+README_V34_FINAL.md
+.gitignore_V34_RECOMMENDED
+.gitignore_v34_temp_backup
+
+# Test files
+test_*.py
+test_*.txt
+v25_test.txt
+knowledge/test_*.txt
+knowledge/v25_test.txt
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
