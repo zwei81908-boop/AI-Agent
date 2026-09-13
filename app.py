@@ -1,3 +1,4 @@
+# V35 FINAL｜云端知识库 + 专项训练连续出题修复
 import os
 import streamlit as st
 
@@ -262,6 +263,20 @@ with st.sidebar:
         ],
     )
 
+    # V35：切换页面时，如果进入专项训练，
+    # 只清理当前题目界面，不删除历史学习记录。
+    _previous_menu_v35 = st.session_state.get("_last_menu_v35")
+
+    if menu == "📝 AI专项训练" and _previous_menu_v35 != "📝 AI专项训练":
+        st.session_state["training_question"] = None
+        st.session_state["training_submitted"] = False
+        st.session_state["last_result"] = None
+        st.session_state.pop("training_answer_v35", None)
+        st.session_state["_training_page_initialized"] = True
+
+    st.session_state["_last_menu_v35"] = menu
+
+
     st.divider()
     st.caption(
         "🟢 云端数据库已连接"
@@ -331,145 +346,175 @@ if menu == "📅 今日任务":
 
 elif menu == "📝 AI专项训练":
     st.subheader("📝 AI专项训练")
-    st.caption("先答题，提交后才显示正确答案和解析。")
 
-    if "training_question" not in st.session_state:
-        st.session_state.training_question = None
-    if "training_submitted" not in st.session_state:
-        st.session_state.training_submitted = False
-    if "last_result" not in st.session_state:
-        st.session_state.last_result = None
-    if "training_topic" not in st.session_state:
-        st.session_state.training_topic = ""
+    # ========================================================
+    # V35：进入专项训练时清理上一题的界面状态
+    # 但不删除历史学习记录
+    # ========================================================
 
-    default_topic = st.session_state.get(
-        "training_topic"
-    ) or agent.choose_adaptive_topic()
+    if st.session_state.get("_training_page_initialized") is not True:
+        st.session_state["_training_page_initialized"] = True
+        st.session_state["training_submitted"] = False
+        st.session_state["last_result"] = None
+        st.session_state["training_answer_v35"] = None
+        st.session_state["training_question"] = None
 
     topic = st.text_input(
         "训练知识点",
-        value=default_topic,
+        value=agent.choose_adaptive_topic(),
         placeholder="例如：软件测试、数据结构、软件开发方法",
-        key="training_topic_input",
+        key="training_topic_v35",
     )
 
-    if st.button("🎯 生成一道题", type="primary"):
-        reset_training_state()
-        st.session_state.training_topic = topic.strip() or default_topic
+    # ========================================================
+    # V35：第一次生成题目
+    # ========================================================
 
-        with st.spinner("正在生成题目，请稍候..."):
-            try:
-                st.session_state.training_question = get_training_question(
-                    st.session_state.training_topic
-                )
-                st.rerun()
-            except Exception as e:
-                if is_question_exhausted_error(e):
-                    st.warning(f"📭 {e}")
-                else:
+    if st.session_state.get("training_question") is None:
+
+        if st.button(
+            "🎯 生成一道题",
+            type="primary",
+            key="generate_training_v35",
+        ):
+            with st.spinner("正在检索云端知识库并生成题目..."):
+                try:
+                    agent.start_training(topic)
+
+                    st.session_state["training_question"] = agent.current_question
+                    st.session_state["training_submitted"] = False
+                    st.session_state["last_result"] = None
+                    st.session_state["training_answer_v35"] = None
+
+                    st.rerun()
+
+                except Exception as e:
                     st.error(f"出题失败：{e}")
+
+    # ========================================================
+    # 当前题目
+    # ========================================================
 
     q = st.session_state.get("training_question")
 
     if q:
-        st.markdown("### 📖 题目")
+        q = agent.normalize_question(q)
+
+        # 同步 Agent 当前题目
+        agent.current_question = q
+
+        st.markdown("### 📝 当前题目")
         st.write(q.get("question", ""))
 
         opts = q.get("options", {})
-        if not isinstance(opts, dict):
-            opts = {}
 
-        answer_key = "training_answer_v33"
-        if st.session_state.training_submitted:
-            answer = st.session_state.get(answer_key, "A")
-        else:
+        # ====================================================
+        # 未提交：显示选择题
+        # ====================================================
+
+        if not st.session_state.get("training_submitted", False):
+
             answer = st.radio(
                 "选择答案",
                 ["A", "B", "C", "D"],
                 format_func=lambda x: f"{x}. {opts.get(x, '')}",
-                key=answer_key,
+                key="training_answer_v35",
             )
 
-        if not st.session_state.training_submitted:
-            if st.button("提交答案", type="primary"):
+            if st.button(
+                "提交答案",
+                type="primary",
+                key="submit_training_v35",
+            ):
                 before_q = dict(q)
+
                 is_correct = (
-                    answer.upper()
+                    answer
                     == str(before_q.get("correct_answer", "")).upper()
                 )
 
                 try:
                     agent.current_question = before_q
 
-                    # V32：禁止提交后自动生成下一题。
-                    # 新版 agent.py 支持 advance=False；
-                    # 老版 agent.py 则通过关闭 training_mode 兼容。
-                    try:
-                        agent.grade_answer(answer, advance=False)
-                    except TypeError:
-                        old_training_mode = getattr(agent, "training_mode", False)
-                        try:
-                            agent.training_mode = False
-                            agent.grade_answer(answer)
-                        finally:
-                            agent.training_mode = old_training_mode
+                    # grade_answer 负责学习记录 / 错题等持久化
+                    agent.grade_answer(answer)
 
-                    # V33：agent.grade_answer 已负责本地 + 云端保存，避免重复写入 Supabase。
-                    clear_cloud_cache()
+                    st.session_state["training_submitted"] = True
+                    st.session_state["last_result"] = is_correct
 
-                    st.session_state.training_submitted = True
-                    st.session_state.last_result = is_correct
+                    # 关键：提交后清除 radio 的旧选择状态
+                    st.session_state.pop("training_answer_v35", None)
+
                     st.rerun()
 
                 except Exception as e:
                     st.error(f"答题失败：{e}")
 
-        else:
-            correct = str(q.get("correct_answer", "")).upper()
+        # ====================================================
+        # 已提交：显示结果 + 直接生成下一题
+        # ====================================================
 
-            if st.session_state.last_result:
+        else:
+
+            correct = str(
+                q.get("correct_answer", "")
+            ).upper()
+
+            if st.session_state.get("last_result"):
                 st.success("🎉 回答正确！学习记录已保存。")
             else:
                 st.error("❌ 回答错误！错题和学习记录已保存。")
 
-            st.markdown(f"### ✅ 正确答案：**{correct}**")
+            st.markdown(
+                f"### ✅ 正确答案：**{correct}**"
+            )
 
             if opts.get(correct):
-                st.write(f"**{correct}. {opts.get(correct)}**")
+                st.write(
+                    f"**{correct}. {opts.get(correct)}**"
+                )
 
-            explanation = q.get("explanation", "")
-            if explanation:
-                st.info(f"📖 **解析：** {explanation}")
+            if q.get("explanation"):
+                st.info(
+                    f"📖 **解析：** {q.get('explanation')}"
+                )
 
             st.divider()
 
-            if st.button("➡️ 下一题", type="primary"):
-                st.session_state.training_question = None
-                st.session_state.training_submitted = False
-                st.session_state.last_result = None
-                st.session_state.pop("training_answer_v33", None)
+            # =================================================
+            # V35 核心：
+            # 点击一次直接生成下一题
+            # =================================================
 
-                with st.spinner("正在生成下一题..."):
+            if st.button(
+                "🎯 再生成一道题",
+                type="primary",
+                key="next_training_v35",
+            ):
+
+                with st.spinner("正在生成下一道题..."):
                     try:
-                        agent.start_training(
-                            st.session_state.training_topic
-                        )
-                        new_q = getattr(agent, "current_question", None)
-                        if not new_q:
-                            raise RuntimeError("没有生成新的题目")
+                        # 直接生成下一题
+                        agent.start_training(topic)
 
-                        st.session_state.training_question = agent.normalize_question(new_q)
+                        # 把新题直接放进 session_state
+                        st.session_state["training_question"] = (
+                            agent.current_question
+                        )
+
+                        # 清理上一题所有 UI 状态
+                        st.session_state["training_submitted"] = False
+                        st.session_state["last_result"] = None
+                        st.session_state.pop(
+                            "training_answer_v35",
+                            None,
+                        )
+
+                        # 直接重新渲染新题
                         st.rerun()
 
                     except Exception as e:
-                        if "没有新的" in str(e) or "新题" in str(e) or "Exhausted" in str(e):
-                            st.warning(str(e))
-                        else:
-                            st.error(f"生成下一题失败：{e}")
-
-# ============================================================
-# 错题复习
-# ============================================================
+                        st.error(f"下一题生成失败：{e}")
 
 elif menu == "❌ 错题复习":
     st.subheader("❌ 错题复习")
@@ -721,31 +766,38 @@ elif menu == "💬 AI知识库问答":
 
     query = st.text_area(
         "输入你的问题",
-        placeholder="例如：结构化方法是什么？黑盒测试和白盒测试有什么区别？",
+        placeholder="例如：什么是结构化方法？黑盒测试和白盒测试有什么区别？",
         height=120,
+        key="knowledge_query_v35",
     )
 
-    if st.button("🔎 查询知识库并回答", type="primary"):
+    if st.button("🔎 查询知识库并回答", type="primary", key="knowledge_query_btn_v35"):
         if not query.strip():
             st.warning("请先输入问题。")
         else:
-            with st.spinner("正在检索知识库并生成回答..."):
+            with st.spinner("正在检索云端知识库并生成回答..."):
                 try:
-                    ctx = agent.search_knowledge(query, 3)
+                    # V35：强制使用当前 app 已绑定的云端 RAG
+                    ctx = agent.search_knowledge(query, 5)
+
                     answer = agent.ai(
                         f"""
-请根据下面的软件设计师知识库回答用户问题。
+你是软件设计师考试学习助手。
+
+请严格根据下面的【云端知识库】回答用户问题。
 
 要求：
 1. 优先依据知识库。
 2. 不要编造知识库中没有的信息。
-3. 如果资料不足，请明确说明。
-4. 最后给出“考试记忆点”。
+3. 如果资料中有相关内容，请直接解释。
+4. 用初学者容易理解的方式回答。
+5. 最后给出“考试记忆点”。
+6. 如果知识库确实没有相关内容，再明确说明。
 
 用户问题：
 {query}
 
-知识库：
+云端知识库：
 {ctx}
 """
                     )
@@ -753,15 +805,11 @@ elif menu == "💬 AI知识库问答":
                     st.markdown("### 🤖 AI回答")
                     st.write(answer)
 
-                    with st.expander("📚 查看本次检索到的知识"):
+                    with st.expander("📚 查看本次检索到的云端知识"):
                         st.text(ctx)
 
                 except Exception as e:
-                    st.error(f"问答失败：{e}")
-
-# ============================================================
-# 知识库管理
-# ============================================================
+                    st.error(f"云端知识库问答失败：{e}")
 
 elif menu == "📚 知识库管理":
     st.title("📚 知识库管理")
@@ -772,7 +820,7 @@ elif menu == "📚 知识库管理":
 
     km = knowledge_manager
 
-    st.caption("☁️ Supabase 云端知识库 + 本地知识库缓存")
+    st.caption("☁️ Supabase 云端知识库｜云端资料为主要数据源")
 
     try:
         cloud_files = km.get_cloud_knowledge_files()
